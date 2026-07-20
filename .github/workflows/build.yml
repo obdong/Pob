@@ -24,17 +24,20 @@ jobs:
       - name: Cache Buildozer dependencies
         uses: actions/cache@v4
         with:
+          # 只缓存 SDK/NDK/p4a 等大文件下载；绝不缓存项目内 .buildozer
+          # （里面的构建 venv 跨 Python 版本复用会导致 pip 损坏）
           path: |
-            ~/.buildozer_global
-            ~/.buildozer/android
-            .buildozer
-          key: buildozer-${{ runner.os }}-v2-${{ hashFiles('buildozer.spec') }}
-          restore-keys: buildozer-${{ runner.os }}-v2
+            ~/.buildozer/android/platform
+            ~/.buildozer/android/packages
+          key: buildozer-${{ runner.os }}-v3-${{ hashFiles('buildozer.spec') }}
 
       - name: Install Buildozer & Cython
         run: |
           pip install --upgrade pip setuptools
           pip install buildozer cython
+
+      - name: Clean stale build state
+        run: rm -rf .buildozer bin
 
       - name: Build Debug APK
         run: yes | buildozer android debug
