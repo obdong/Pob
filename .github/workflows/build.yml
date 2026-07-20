@@ -7,7 +7,7 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
@@ -19,7 +19,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y git zip unzip openjdk-17-jdk python3-pip autoconf libtool pkg-config zlib1g-dev libncurses-dev cmake libffi-dev libssl-dev
+          sudo apt-get install -y git zip unzip openjdk-17-jdk python3-pip autoconf automake libtool libtool-bin pkg-config zlib1g-dev libncurses-dev cmake libffi-dev libssl-dev
 
       - name: Cache Buildozer dependencies
         uses: actions/cache@v4
@@ -28,8 +28,8 @@ jobs:
             ~/.buildozer_global
             ~/.buildozer/android
             .buildozer
-          key: buildozer-${{ runner.os }}-v1-${{ hashFiles('buildozer.spec') }}
-          restore-keys: buildozer-${{ runner.os }}-v1
+          key: buildozer-${{ runner.os }}-v2-${{ hashFiles('buildozer.spec') }}
+          restore-keys: buildozer-${{ runner.os }}-v2
 
       - name: Install Buildozer & Cython
         run: |
@@ -38,7 +38,7 @@ jobs:
 
       - name: Build Debug APK
         run: yes | buildozer android debug
-        timeout-minutes: 60
+        timeout-minutes: 90
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
