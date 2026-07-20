@@ -53,8 +53,9 @@ android.ndk = 25b
 # (str) Android SDK version to download (if not installed)
 android.sdk = 33
 
-# (str) Android archs to build for — mainstream ARM architectures
-android.archs = armeabi-v7a, arm64-v8a
+# (str) Android archs to build for — arm64 only (all modern phones; avoids p4a
+# re-creating the build venv per arch, which currently corrupts pip)
+android.archs = arm64-v8a
 
 # (str) Android permissions required
 android.permissions = INTERNET, ACCESS_NETWORK_STATE, ACCESS_WIFI_STATE
