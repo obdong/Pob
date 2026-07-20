@@ -16,11 +16,17 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git zip unzip openjdk-17-jdk python3-pip autoconf libtool pkg-config zlib1g-dev libncurses-dev libtinfo5 cmake libffi-dev libssl-dev
+
       - name: Cache Buildozer dependencies
         uses: actions/cache@v4
         with:
           path: |
             ~/.buildozer_global
+            ~/.buildozer/android
             .buildozer
           key: buildozer-${{ runner.os }}-v1-${{ hashFiles('buildozer.spec') }}
           restore-keys: buildozer-${{ runner.os }}-v1
@@ -31,7 +37,7 @@ jobs:
           pip install buildozer cython
 
       - name: Build Debug APK
-        run: buildozer android debug
+        run: yes | buildozer android debug
         timeout-minutes: 60
 
       - name: Upload APK artifact
