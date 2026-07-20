@@ -23,7 +23,7 @@ version = 1.0.0
 
 # (str) Application requirements
 # kivy==2.2.0 or latest stable; ensure compatibility
-requirements = python3==3.11,hostpython3==3.11,kivy==2.2.0
+requirements = python3==3.11.9,hostpython3==3.11.9,kivy==2.2.0
 
 # (str) Custom application flags
 # android.allow_backup = True
