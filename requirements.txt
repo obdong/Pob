@@ -1,0 +1,9 @@
+# 基础扫描功能仅使用 Python 标准库，无需第三方依赖。
+
+# 局域网管控功能（一键禁止上网 / 观测网速）需要以下依赖：
+#   1) scapy：构造与发送 ARP 包、抓取流量
+#   2) Npcap：Windows 下的底层抓包驱动（到 https://npcap.com 安装，
+#      安装时务必勾选 "Install Npcap in WinPcap API-compatible Mode"）
+#
+# 另外，运行程序时必须「以管理员身份运行」。
+scapy>=2.5.0

