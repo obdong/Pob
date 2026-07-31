@@ -537,7 +537,7 @@ class LANScannerApp:
                 ctrl_disp = "■ 已禁网" if st["block"] else "● 测速中"
             else:
                 ctrl_disp = "○ 允许"
-            speed_disp = self._fmt_speed(st["up"], st["down"]) if st else ""
+            speed_disp = f"↑{st['up_k']:.0f} ↓{st['down_k']:.0f} KB/s" if st else ""
             item = self.tree.insert("", tk.END,
                              values=(ip, dev.get("mac", ""), vendor,
                                      dev.get("name", ""), ports_disp,
@@ -709,8 +709,12 @@ class LANScannerApp:
         try:
             import scapy.all as scapy_mod
             self.scapy = scapy_mod
-            self.iface = scapy_mod.conf.iface
-            self.local_mac = scapy_mod.get_if_hwaddr(self.iface) if self.iface else ""
+            self.iface = self._pick_iface(scapy_mod)
+            if not self.iface:
+                messagebox.showerror("网卡错误",
+                                     "未能找到可用网卡，请确认已安装 Npcap 且以管理员身份运行。")
+                return False
+            self.local_mac = scapy_mod.get_if_hwaddr(self.iface)
             return True
         except Exception as e:
             messagebox.showerror(
@@ -788,7 +792,7 @@ class LANScannerApp:
             scapy.sendp(scapy.Ether(dst=gmac) /
                         scapy.ARP(op=2, pdst=gip, psrc=ip, hwdst=gmac, hwsrc=amac),
                         verbose=0, iface=self.iface)
-            time.sleep(1)
+            time.sleep(0.5)
 
     def _sniff_loop(self, state):
         scapy = self.scapy
@@ -796,9 +800,13 @@ class LANScannerApp:
         gmac, amac = self.gateway_mac, self.local_mac
 
         def handle(pkt):
+            # 跳过自己转发出去的包，避免抓回来再转发造成回环风暴
+            if pkt.haslayer(scapy.Ether) and pkt[scapy.Ether].src == amac:
+                return
             if not pkt.haslayer(scapy.IP):
                 return
             iph = pkt[scapy.IP]
+            state["pkts"] += 1
             if iph.src == ip:           # 目标 → 外网（上行）
                 state["up"] += len(pkt)
                 if not state["block"] and pkt.haslayer(scapy.Ether):
@@ -813,10 +821,10 @@ class LANScannerApp:
         while not state["stop"].is_set():
             try:
                 scapy.sniff(filter=f"host {ip}", prn=handle, store=0,
-                            iface=self.iface, timeout=1)
+                            iface=self.iface, timeout=1, promisc=True)
             except Exception as e:
                 print("sniff error:", e)
-                break
+                time.sleep(1)
 
     def _restore_arp(self, state):
         if not self.scapy:
