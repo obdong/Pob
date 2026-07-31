@@ -43,18 +43,3 @@ python lan_scanner.py
 - 关闭程序会自动停止欺骗并还原 ARP 表。
 
 ⚠️ **仅限你自己拥有或已授权的局域网内测试使用**，并事先取得相关方同意。开启管控后目标流量会经过本机；关闭开关或退出程序会立即还原，不影响网络。
-
-## Android 版 (Kivy)
-```bash
-# 本地打包 (需 Linux):
-pip install buildozer
-buildozer android debug
-
-# GitHub Actions 自动打包:
-# 推送代码到 main 分支 → Actions 自动构建 APK → Artifacts 下载
-```
-
-## 下载 APK
-推送到 GitHub 后，前往 **Actions → Build Android APK → Artifacts** 下载 `LANScanner-debug-apk.zip`，解压后安装 APK。
-
-⚠️ 安卓上 ping/ARP 可能受系统权限限制；部分 ROM 需 root 才能读 `/proc/net/arp`。
