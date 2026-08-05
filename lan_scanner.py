@@ -323,6 +323,10 @@ class LANScannerApp:
 
         self.tree.tag_configure("online", foreground="#1a7f37")
         self.tree.tag_configure("offline", foreground="#999999")
+        # 被禁网：暗红字 + 浅红底，一眼区分于普通离线
+        self.tree.tag_configure("blocked", foreground="#a40000", background="#fff0f0")
+        # 测速中：蓝字
+        self.tree.tag_configure("monitoring", foreground="#0969da")
         # 浅色斑马纹 + 选中高亮
         self.tree.tag_configure("zebra", background="#f6f8fa")
 
@@ -713,12 +717,18 @@ class LANScannerApp:
                 ports_disp = ""
             vendor = lookup_oui(dev.get("mac", ""))
             tag = "online" if dev["ip"] in self.online_ips else "offline"
-            if idx % 2 == 1:
+            # 被禁/测速中的设备用专属 tag（不叠加 zebra，保证背景色不被覆盖）
+            st = self.mitm.get(ip)
+            if st:
+                if st["block"]:
+                    tag = "blocked"
+                else:
+                    tag = "monitoring"
+            if idx % 2 == 1 and tag in ("online", "offline"):
                 tag = (tag, "zebra")
             ip = dev["ip"]
             icon = self._icon_for(ip, dev)
             ip_disp = f"{icon}  {ip}"
-            st = self.mitm.get(ip)
             if st:
                 if st["block"]:
                     ctrl_disp = "🚫 已禁网"
@@ -726,7 +736,7 @@ class LANScannerApp:
                     ctrl_disp = "📊 测速中"
             else:
                 ctrl_disp = "✅ 允许"
-            speed_disp = f"↑{st['up_k']:.0f} ↓{st['down_k']:.0f} KB/s" if st else "—"
+            speed_disp = f"↑{st.get('up_k', 0):.0f} ↓{st.get('down_k', 0):.0f} KB/s" if st else "—"
             item = self.tree.insert("", tk.END,
                              values=(ip_disp, dev.get("mac", ""), vendor,
                                      dev.get("name", ""), ports_disp,
@@ -1239,6 +1249,7 @@ class LANScannerApp:
             return
         state = {"ip": ip, "tmac": tmac, "block": block,
                  "stop": threading.Event(), "up": 0, "down": 0,
+                 "up_k": 0.0, "down_k": 0.0,         # KB/s，供 update_treeview 读取
                  "last": time.time(), "threads": []}
         self.mitm[ip] = state
         t1 = threading.Thread(target=self._spoof_loop, args=(state,), daemon=True)
@@ -1345,6 +1356,9 @@ class LANScannerApp:
                 st["up"] = 0
                 st["down"] = 0
                 st["last"] = now
+                # 写回 state，让 update_treeview 能读到
+                st["up_k"] = up_k
+                st["down_k"] = down_k
                 item = self.tree_items.get(ip)
                 if item:
                     self.tree.set(item, "speed", f"↑{up_k:.0f} ↓{down_k:.0f} KB/s")
