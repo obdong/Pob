@@ -206,11 +206,13 @@ class LANScannerApp:
         style.configure("TCombobox", fieldbackground="white")
         style.configure("TEntry", fieldbackground="white", background="white")
         style.configure("Treeview", background="white", fieldbackground="white",
-                        foreground="#000000", rowheight=22)
+                        foreground="#000000", rowheight=26)
         style.configure("Treeview.Heading", background="#c0c0c0", relief="raised",
                         borderwidth=2, font=("Lucida Console", 10, "bold"))
         style.map("Treeview", background=[("selected", "#000080")],
                   foreground=[("selected", "#ffffff")])
+        style.map("Treeview.Heading",
+                  background=[("active", "#a0a0a0")])
         style.configure("TProgressbar", troughcolor="#808080", background="#000080")
         self.root.option_add("*Font", font)
 
@@ -502,6 +504,69 @@ class LANScannerApp:
         finally:
             self.root.after(0, self.progress.stop)
 
+    # ---------- 图标 ----------
+    # 设备类型 → emoji 图标集中映射，离线/未知/本机/网关/手机/电脑/打印机/路由/游戏/IoT
+    _ICON_RULES = [
+        # (匹配字段+子串, 图标)
+        ("router",  "📡"),  # 路由器（含网关）
+        ("printer", "🖨️"),
+        ("mobile",  "📱"),
+        ("gaming",  "🎮"),
+        ("iot",     "🔌"),
+        ("pc",      "💻"),
+    ]
+    _ICON_KEYWORDS = {
+        # 关键词（小写）→ 上述 _ICON_RULES 中的规则名
+        "router":  ("tp-link", "tplink", "cisco", "mikrotik", "netgear", "asus",
+                    "d-link", "dlink", "mercusys", "fast", "zte", "router", "gateway"),
+        "printer": ("canon", "epson", "brother", "xerox", "ricoh", "lexmark", "kyocera", "printer"),
+        "mobile":  ("apple", "samsung", "huawei", "xiaomi", "oppo", "vivo", "oneplus",
+                    "meizu", "redmi", "pixel", "honor", "mobile", "phone", "ipad", "iphone",
+                    "realme", "poco"),
+        "gaming":  ("sony", "nintendo", "razer", "playstation", "xbox", "valve"),
+        "iot":     ("espressif", "tuya", "amazon", "google", "nest", "ring", "shelly", "esp32", "esp8266"),
+        "pc":      ("lenovo", "dell", "intel", "realtek", "asustek", "msi", "giga",
+                    "acer", "fujitsu", "toshiba", "logitech", "broadcom", "microsoft"),
+    }
+
+    def _icon_for(self, ip, dev):
+        """根据设备类型/状态，返回对应图标 emoji（已按优先级排序）"""
+        try:
+            vendor = (lookup_oui(dev.get("mac", "")) or "").lower()
+        except Exception:
+            vendor = ""
+        name = (dev.get("name", "") or "").lower()
+        online = ip in self.online_ips
+
+        # 优先级: 本机 → 网关 → 离线 → 端口识别 → OUI 关键字
+        if getattr(self, "local_ip", None) and ip == self.local_ip:
+            return "🖥️"
+        if getattr(self, "gateway", None) and ip == self.gateway:
+            return "📡"
+        if not online:
+            return "⚫"
+
+        # 端口特征: 同时开 80+443 → 多半是网关/服务
+        ports = dev.get("ports", []) or []
+        if 80 in ports and 443 in ports:
+            return "📡"
+        if 631 in ports or 9100 in ports:
+            return "🖨️"
+
+        # 按规则优先匹配
+        for rule_name, icon in self._ICON_RULES:
+            keywords = self._ICON_KEYWORDS.get(rule_name, ())
+            for kw in keywords:
+                if kw in vendor or kw in name:
+                    return icon
+        return "💻"
+
+    @staticmethod
+    def _strip_ip(s):
+        """从 IP 列展示字符串（可能含图标前缀）中提取纯 IPv4"""
+        m = re.search(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}", s or "")
+        return m.group(0) if m else ""
+
     # ---------- 表格 ----------
     def update_treeview(self):
         for item in self.tree.get_children():
@@ -520,7 +585,7 @@ class LANScannerApp:
         except Exception:
             sorted_devs = filtered
 
-        for dev in sorted_devs:
+        for idx, dev in enumerate(sorted_devs):
             ports = dev.get("ports", [])
             if isinstance(ports, list) and ports:
                 ports_disp = ", ".join(
@@ -531,19 +596,26 @@ class LANScannerApp:
                 ports_disp = ""
             vendor = lookup_oui(dev.get("mac", ""))
             tag = "online" if dev["ip"] in self.online_ips else "offline"
+            if idx % 2 == 1:
+                tag = (tag, "zebra")
             ip = dev["ip"]
+            icon = self._icon_for(ip, dev)
+            ip_disp = f"{icon}  {ip}"
             st = self.mitm.get(ip)
             if st:
-                ctrl_disp = "■ 已禁网" if st["block"] else "● 测速中"
+                if st["block"]:
+                    ctrl_disp = "🚫 已禁网"
+                else:
+                    ctrl_disp = "📊 测速中"
             else:
-                ctrl_disp = "○ 允许"
-            speed_disp = f"↑{st['up_k']:.0f} ↓{st['down_k']:.0f} KB/s" if st else ""
+                ctrl_disp = "✅ 允许"
+            speed_disp = f"↑{st['up_k']:.0f} ↓{st['down_k']:.0f} KB/s" if st else "—"
             item = self.tree.insert("", tk.END,
-                             values=(ip, dev.get("mac", ""), vendor,
+                             values=(ip_disp, dev.get("mac", ""), vendor,
                                      dev.get("name", ""), ports_disp,
                                      dev.get("last_seen", ""), dev.get("note", ""),
                                      ctrl_disp, speed_disp),
-                             tags=(tag,))
+                             tags=tag if isinstance(tag, tuple) else (tag,))
             self.tree_items[ip] = item
 
         self.status_var.set(
@@ -555,8 +627,8 @@ class LANScannerApp:
             return
 
         def keyf(v):
-            val = v[0]
-            if col == "ip" and re.match(r'^\d+\.\d+\.\d+\.\d+$', val):
+            val = self._strip_ip(v[0]) if v[0] else v[0]
+            if re.match(r'^\d+\.\d+\.\d+\.\d+$', val):
                 return tuple(int(p) for p in val.split('.'))
             return val
 
@@ -581,7 +653,7 @@ class LANScannerApp:
         if not sel:
             return
         item = sel[0]
-        ip = self.tree.set(item, "ip")
+        ip = self._strip_ip(self.tree.set(item, "ip"))
         dev = next((d for d in self.devices if d["ip"] == ip), None)
         if not dev:
             return
@@ -615,7 +687,7 @@ class LANScannerApp:
             return
         if not messagebox.askyesno("确认", f"确定删除选中的 {len(sel)} 台设备?"):
             return
-        ips = {self.tree.set(i, "ip") for i in sel}
+        ips = {self._strip_ip(self.tree.set(i, "ip")) for i in sel}
         self.devices = [d for d in self.devices if d["ip"] not in ips]
         self.update_treeview()
 
@@ -894,7 +966,7 @@ class LANScannerApp:
             return
         item = self.tree.identify_row(event.y)
         if item:
-            ip = self.tree.set(item, "ip")
+            ip = self._strip_ip(self.tree.set(item, "ip"))
             self.toggle_block(ip)
 
     def toggle_block(self, ip):
@@ -916,14 +988,14 @@ class LANScannerApp:
         if not sel:
             messagebox.showinfo("提示", "请先选中一台设备。")
             return
-        self.toggle_block(self.tree.set(sel[0], "ip"))
+        self.toggle_block(self._strip_ip(self.tree.set(sel[0], "ip")))
 
     def toggle_monitor_selected(self):
         sel = self.tree.selection()
         if not sel:
             messagebox.showinfo("提示", "请先选中一台设备。")
             return
-        self.toggle_monitor(self.tree.set(sel[0], "ip"))
+        self.toggle_monitor(self._strip_ip(self.tree.set(sel[0], "ip")))
 
     def on_close(self):
         try:
