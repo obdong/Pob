@@ -1117,21 +1117,35 @@ class LANScannerApp:
             self.iface = self._pick_iface(scapy_mod)
         except Exception as e:
             # _pick_iface 报错（可能 Npcap 驱动问题）
+            import os
+            npcap_installed = os.path.isdir(r"C:\Windows\System32\Npcap")
+            hint = ""
+            if not npcap_installed:
+                hint = ("检测到 Npcap 未安装！请到 https://npcap.com 下载安装，\n"
+                        "安装时务必勾选 \"Install Npcap in WinPcap API-compatible Mode\"。\n\n")
+            else:
+                hint = ("Npcap 已安装但驱动可能异常，请尝试：\n"
+                        "  1. 卸载 Npcap 后重新安装（勾选 WinPcap 兼容模式）\n"
+                        "  2. 以管理员身份运行本程序\n\n")
             messagebox.showerror(
                 "网卡检测失败",
-                f"scapy 导入成功，但无法获取可用网卡。\n"
-                f"常见原因：Npcap 未安装或驱动异常。\n\n"
-                f"请到 https://npcap.com 安装 Npcap，\n"
-                f"安装时勾选 \"Install Npcap in WinPcap API-compatible Mode\"。\n"
-                f"如已安装，可尝试卸载后重新安装。\n\n"
+                f"scapy 导入成功，但无法获取可用网卡。\n\n"
+                f"{hint}"
                 f"原始错误: {e}")
             self.scapy = None
             return False
         if not self.iface:
+            import os
+            npcap_installed = os.path.isdir(r"C:\Windows\System32\Npcap")
+            hint = ""
+            if not npcap_installed:
+                hint = "  ⚠ 未检测到 Npcap，请先安装（https://npcap.com）\n"
+            else:
+                hint = "  ✓ Npcap 已安装，但驱动可能异常，请重新安装\n"
             messagebox.showerror("网卡错误",
                                  "未能找到可用网卡。\n\n"
                                  "请确认：\n"
-                                 "  1. 已安装 Npcap（https://npcap.com）\n"
+                                 f"{hint}"
                                  "  2. 安装时勾选了 \"WinPcap 兼容模式\"\n"
                                  "  3. 以管理员身份运行本程序\n"
                                  "  4. 电脑至少有一块已连接网络的网卡")
@@ -1149,6 +1163,38 @@ class LANScannerApp:
             self.scapy = None
             return False
         return True
+
+    def _pick_iface(self, scapy_mod):
+        """根据本机出站 IP 从 scapy 网卡列表中选出正确的网卡。
+        三层回退：IP 匹配 → scapy 默认 → 第一个可用。
+        """
+        local_ip = self._local_ip()
+        # 1) 按 IP 匹配：遍历 scapy 的网卡列表，找到 IP 与本机一致的
+        if local_ip:
+            try:
+                for iface in scapy_mod.get_working_ifaces():
+                    try:
+                        if scapy_mod.get_if_addr(iface) == local_ip:
+                            return iface
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+        # 2) 回退：scapy 自己的默认网卡
+        try:
+            default = scapy_mod.conf.iface
+            if default:
+                return default
+        except Exception:
+            pass
+        # 3) 最后回退：取第一个可用网卡
+        try:
+            ifaces = scapy_mod.get_working_ifaces()
+            if ifaces:
+                return ifaces[0]
+        except Exception:
+            pass
+        return None
 
     def _local_ip(self):
         import socket
