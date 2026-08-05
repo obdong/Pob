@@ -1073,7 +1073,7 @@ class LANScannerApp:
     #   - 观测网速：欺骗后正常转发，统计上行/下行字节
     # 关闭开关会立刻停止欺骗并还原双方 ARP。仅限自己/授权网络使用。
     def ensure_scapy(self):
-        """延迟导入 scapy，并检查管理员权限。"""
+        """延迟导入 scapy，并检查管理员权限。给出精确诊断信息。"""
         if self.scapy is not None:
             return True
         if platform.system() == "Windows":
@@ -1087,24 +1087,68 @@ class LANScannerApp:
                     return False
             except Exception:
                 pass
+        # ---- 第 1 步：尝试导入 scapy ----
         try:
             import scapy.all as scapy_mod
-            self.scapy = scapy_mod
+        except ModuleNotFoundError as e:
+            # scapy 真的没装，或打包后没带进去
+            messagebox.showerror(
+                "未找到 scapy 模块",
+                "Python 环境中没有 scapy，或打包后的 EXE 未包含 scapy。\n\n"
+                "【如果是直接运行 .py 文件】\n"
+                "  请在命令行执行: pip install scapy\n\n"
+                "【如果是运行打包后的 .exe 文件】\n"
+                "  请重新打包，build_exe.bat 需加 --collect-all scapy。\n"
+                "  或直接运行 .py 文件（需先 pip install scapy）。\n\n"
+                f"原始错误: {e}")
+            return False
+        except Exception as e:
+            # scapy 安装了但导入时出错（可能是 Npcap 缺失）
+            messagebox.showerror(
+                "scapy 导入失败",
+                f"scapy 已安装但导入时出错，通常是 Npcap 未安装或版本不兼容。\n\n"
+                f"请到 https://npcap.com 下载安装 Npcap，\n"
+                f"安装时务必勾选 \"Install Npcap in WinPcap API-compatible Mode\"。\n\n"
+                f"原始错误: {e}")
+            return False
+        # ---- 第 2 步：选择网卡 ----
+        self.scapy = scapy_mod
+        try:
             self.iface = self._pick_iface(scapy_mod)
-            if not self.iface:
-                messagebox.showerror("网卡错误",
-                                     "未能找到可用网卡，请确认已安装 Npcap 且以管理员身份运行。")
-                return False
+        except Exception as e:
+            # _pick_iface 报错（可能 Npcap 驱动问题）
+            messagebox.showerror(
+                "网卡检测失败",
+                f"scapy 导入成功，但无法获取可用网卡。\n"
+                f"常见原因：Npcap 未安装或驱动异常。\n\n"
+                f"请到 https://npcap.com 安装 Npcap，\n"
+                f"安装时勾选 \"Install Npcap in WinPcap API-compatible Mode\"。\n"
+                f"如已安装，可尝试卸载后重新安装。\n\n"
+                f"原始错误: {e}")
+            self.scapy = None
+            return False
+        if not self.iface:
+            messagebox.showerror("网卡错误",
+                                 "未能找到可用网卡。\n\n"
+                                 "请确认：\n"
+                                 "  1. 已安装 Npcap（https://npcap.com）\n"
+                                 "  2. 安装时勾选了 \"WinPcap 兼容模式\"\n"
+                                 "  3. 以管理员身份运行本程序\n"
+                                 "  4. 电脑至少有一块已连接网络的网卡")
+            self.scapy = None
+            return False
+        # ---- 第 3 步：获取本机 MAC ----
+        try:
             self.local_mac = scapy_mod.get_if_hwaddr(self.iface)
-            return True
         except Exception as e:
             messagebox.showerror(
-                "缺少 scapy / Npcap",
-                "管控功能需要安装 scapy 与 Npcap。\n"
-                "请在命令行执行: pip install scapy\n"
-                "并到 https://npcap.com 安装 Npcap（勾选 WinPcap 兼容模式）。\n"
-                f"错误: {e}")
+                "MAC 地址获取失败",
+                f"网卡已找到 ({self.iface})，但无法读取 MAC 地址。\n"
+                f"可能是 Npcap 驱动问题，请尝试重新安装 Npcap。\n\n"
+                f"原始错误: {e}")
+            self.scapy = None
             return False
+        return True
 
     def _local_ip(self):
         import socket

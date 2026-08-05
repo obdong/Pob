@@ -31,7 +31,7 @@ if errorlevel 1 (
 
 echo.
 echo [3/3] 开始打包 lan_scanner.exe （--onefile --windowed，含自定义图标）...
-python -m PyInstaller --onefile --windowed --name lan_scanner --icon=app.ico --add-data "app.ico;." --hidden-import tkinter --collect-all tkinter lan_scanner.py
+python -m PyInstaller --onefile --windowed --name lan_scanner --icon=app.ico --add-data "app.ico;." --hidden-import tkinter --collect-all tkinter --collect-all scapy --hidden-import scapy.all --hidden-import scapy.arch.windows --hidden-import scapy.layers.l2 --hidden-import scapy.layers.inet lan_scanner.py
 if errorlevel 1 (
     echo [错误] 打包失败，请查看上方日志。
     pause
