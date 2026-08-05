@@ -172,6 +172,7 @@ class LANScannerApp:
         self.gateway = ""          # 网关 IP
         self.gateway_mac = ""      # 网关 MAC
         self.local_mac = ""        # 本机 MAC
+        self.local_ip = ""         # 本机 IP（运行时由 auto_detect_subnet 设置）
         self.iface = None          # scapy 使用的网卡
         self.scapy = None          # 延迟导入的 scapy 模块
         self.mitm = {}             # ip -> {stop, block, up, down, thread...}
@@ -244,7 +245,11 @@ class LANScannerApp:
 
         ttk.Label(ctrl_frame, text="子网前缀:").pack(side=tk.LEFT)
         self.subnet_var = tk.StringVar()
-        ttk.Entry(ctrl_frame, textvariable=self.subnet_var, width=15).pack(side=tk.LEFT, padx=(5, 10))
+        ttk.Entry(ctrl_frame, textvariable=self.subnet_var, width=15).pack(side=tk.LEFT, padx=(5, 4))
+        # 「🔄 自动检测」按钮：手动刷新当前网卡子网
+        ttk.Button(ctrl_frame, text="🔄 自动检测", width=10, command=self.refresh_subnet).pack(side=tk.LEFT, padx=(0, 8))
+        # 启动时自动填子网前缀（用当前出站网卡 IP 的前 3 段）
+        self.auto_detect_subnet()
 
         self.resolve_name_var = tk.BooleanVar(value=True)
         self.scan_ports_var = tk.BooleanVar(value=True)
@@ -292,6 +297,13 @@ class LANScannerApp:
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill="y")
 
+        # ── 列管理：显示/隐藏/锁定宽度 ──
+        self.default_widths = dict(widths)        # 默认宽度备份，用于"恢复默认"
+        self.visible_columns = list(columns)      # 当前可见列
+        self.locked_widths = {}                   # col -> 固定宽度
+        self._width_guard_after = None            # 锁定宽度守卫 timer id
+        self.tree.configure(displaycolumns=self.visible_columns)
+
         # 右键菜单
         self.context_menu = tk.Menu(self.root, tearoff=0, bg="#c0c0c0")
         self.context_menu.add_command(label="编辑名称 / 备注", command=self.edit_selected)
@@ -338,14 +350,42 @@ class LANScannerApp:
 
     # ---------- 子网检测 ----------
     def auto_detect_subnet(self):
+        """自动获取当前活跃网卡的 IPv4 前缀，写入 subnet_var。
+        优先用 UDP 出站 socket（不实际发包，能准确拿到出站网卡 IP）；
+        回退到 socket.gethostbyname；再不行回退 gateway。
+        """
+        ip = ""
+        # 1) UDP 出站 socket（最可靠，反映真实上网网卡）
         try:
-            hostname = socket.gethostname()
-            ip = socket.gethostbyname(hostname)
+            ip = self._local_ip()
+        except Exception:
+            ip = ""
+        # 2) 回退：gethostbyname
+        if not ip:
+            try:
+                ip = socket.gethostbyname(socket.gethostname())
+            except Exception:
+                ip = ""
+        # 3) 回退：网关的网段
+        if not ip and self.gateway:
+            ip = self.gateway
+        if ip:
             parts = ip.split('.')
-            self.subnet_prefix = '.'.join(parts[:3])
-            self.subnet_var.set(self.subnet_prefix)
-        except Exception as e:
-            print(f"自动检测子网失败: {e}")
+            if len(parts) >= 3 and all(parts[i].isdigit() for i in range(3)):
+                self.subnet_prefix = '.'.join(parts[:3])
+                self.subnet_var.set(self.subnet_prefix)
+                # 顺便记住本机 IP，供后续管控/标识
+                self.local_ip = ip
+                return self.subnet_prefix
+        return ""
+
+    def refresh_subnet(self):
+        """手动触发：重新检测并刷新子网框。"""
+        s = self.auto_detect_subnet()
+        if s:
+            self.status_var.set(f"已自动检测子网前缀: {s}.x")
+        else:
+            self.status_var.set("自动检测失败，请手动填写子网前缀。")
 
     # ---------- 网关 / MAC 检测 ----------
     def detect_gateway(self):
@@ -638,8 +678,174 @@ class LANScannerApp:
         for idx, (_, item) in enumerate(items):
             self.tree.move(item, "", idx)
 
+    # ---------- 列管理：右键列头 ----------
+    def on_heading_right_click(self, event):
+        """列头右键：弹出列管理菜单"""
+        region = self.tree.identify_region(event.x, event.y)
+        if region != "heading":
+            return
+        col_id = self.tree.identify_column(event.x)   # '#1' '#2' ...
+        cols = self.tree["columns"]
+        try:
+            idx = int(col_id.replace("#", "")) - 1
+        except ValueError:
+            return
+        if idx < 0 or idx >= len(cols):
+            return
+        col = cols[idx]
+        col_title = self.tree.heading(col, "text")
+        visible = col in self.visible_columns
+        locked = col in self.locked_widths
+
+        menu = tk.Menu(self.root, tearoff=0, bg="#dfdfdf")
+        # 当前列信息
+        cur_w = self.tree.column(col, "width")
+        menu.add_command(label=f"▸ 列: {col_title}    当前宽 {cur_w}px",
+                         state="disabled")
+        menu.add_separator()
+        # 显示/隐藏
+        if visible:
+            menu.add_command(label="🙈 隐藏该列",
+                             command=lambda c=col: self._toggle_column_visibility(c))
+        else:
+            menu.add_command(label="👁  显示该列",
+                             command=lambda c=col: self._toggle_column_visibility(c))
+        # 锁定/解锁
+        if locked:
+            menu.add_command(label="🔓 解除宽度锁定",
+                             command=lambda c=col: self._toggle_column_lock(c))
+        else:
+            menu.add_command(label="🔒 锁定宽度（不再随拖动改变）",
+                             command=lambda c=col: self._toggle_column_lock(c))
+        # 重置单列宽度
+        menu.add_command(label="↺ 恢复该列默认宽度",
+                         command=lambda c=col: self._reset_column_width(c))
+        menu.add_separator()
+        # 批量操作
+        menu.add_command(label="📋 恢复全部默认", command=self._reset_all_columns)
+        menu.add_command(label="👁  全部显示", command=self._show_all_columns)
+        # 解锁所有
+        if self.locked_widths:
+            menu.add_command(label="🔓 全部解锁", command=self._unlock_all_columns)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _toggle_column_visibility(self, col):
+        """显示/隐藏一列（至少保留 2 列可见）"""
+        cols = list(self.tree["columns"])
+        if col in self.visible_columns:
+            if len(self.visible_columns) <= 2:
+                messagebox.showwarning("提示", "至少保留 2 列可见，否则表格无法使用。")
+                return
+            self.visible_columns.remove(col)
+        else:
+            # 按原始列顺序插入
+            self.visible_columns = [c for c in cols if c in self.visible_columns or c == col]
+        self.tree.configure(displaycolumns=self.visible_columns)
+
+    def _toggle_column_lock(self, col):
+        """锁定/解锁当前列宽度。锁定后即使拖动列边界也会被还原回来。"""
+        if col in self.locked_widths:
+            del self.locked_widths[col]
+            self.status_var.set(f"列 [{col}] 宽度已解锁。")
+        else:
+            w = self.tree.column(col, "width")
+            self.locked_widths[col] = w
+            self.status_var.set(f"列 [{col}] 宽度锁定为 {w}px。")
+        if self.locked_widths:
+            self._schedule_width_guard()
+        else:
+            if self._width_guard_after:
+                try:
+                    self.root.after_cancel(self._width_guard_after)
+                except Exception:
+                    pass
+                self._width_guard_after = None
+
+    def _reset_column_width(self, col):
+        """单列恢复默认宽度"""
+        if col in self.default_widths:
+            w = self.default_widths[col]
+            self.tree.column(col, width=w)
+            # 解锁（恢复默认 = 不该继续被锁）
+            if col in self.locked_widths:
+                del self.locked_widths[col]
+            self.status_var.set(f"列 [{col}] 已恢复默认宽度 {w}px。")
+            if self.locked_widths:
+                self._schedule_width_guard()
+            elif self._width_guard_after:
+                try:
+                    self.root.after_cancel(self._width_guard_after)
+                except Exception:
+                    pass
+                self._width_guard_after = None
+
+    def _reset_all_columns(self):
+        """全部恢复默认宽度，全部可见，全部解锁"""
+        for c, w in self.default_widths.items():
+            self.tree.column(c, width=w)
+        self.visible_columns = list(self.tree["columns"])
+        self.tree.configure(displaycolumns=self.visible_columns)
+        self.locked_widths = {}
+        if self._width_guard_after:
+            try:
+                self.root.after_cancel(self._width_guard_after)
+            except Exception:
+                pass
+            self._width_guard_after = None
+        self.status_var.set("已恢复全部列默认设置。")
+
+    def _show_all_columns(self):
+        """全部显示"""
+        self.visible_columns = list(self.tree["columns"])
+        self.tree.configure(displaycolumns=self.visible_columns)
+        self.status_var.set("已显示全部列。")
+
+    def _unlock_all_columns(self):
+        """解除全部宽度锁定"""
+        self.locked_widths = {}
+        if self._width_guard_after:
+            try:
+                self.root.after_cancel(self._width_guard_after)
+            except Exception:
+                pass
+            self._width_guard_after = None
+        self.status_var.set("已解除全部列的宽度锁定。")
+
+    def _schedule_width_guard(self):
+        """周期检查被锁定的列宽，如有改动就还原。"""
+        if self._width_guard_after:
+            try:
+                self.root.after_cancel(self._width_guard_after)
+            except Exception:
+                pass
+        self._width_guard_after = self.root.after(120, self._width_guard_tick)
+
+    def _width_guard_tick(self):
+        for col, target in list(self.locked_widths.items()):
+            try:
+                cur = int(self.tree.column(col, "width"))
+            except Exception:
+                continue
+            if cur != target:
+                try:
+                    self.tree.column(col, width=target)
+                except Exception:
+                    pass
+        if self.locked_widths and self.root.winfo_exists():
+            self._width_guard_after = self.root.after(120, self._width_guard_tick)
+        else:
+            self._width_guard_after = None
+
     # ---------- 右键 / 双击 ----------
     def on_right_click(self, event):
+        # 列头区域 → 弹出列管理菜单
+        region = self.tree.identify_region(event.x, event.y)
+        if region == "heading":
+            self.on_heading_right_click(event)
+            return
         item = self.tree.identify_row(event.y)
         if item:
             self.tree.selection_set(item)
