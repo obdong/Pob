@@ -166,7 +166,17 @@ class LANScannerApp:
         self.devices = []
         self.online_ips = set()
         self.subnet_prefix = ""
+        self.scanning = False                # 扫描进行中标志（防止自动刷新重叠）
         self.local_conn = self.detect_local_connection()
+
+        # ── 自动刷新 ──
+        self._auto_refresh_after = None      # 当前 after id
+        self._auto_refresh_options = {
+            "30秒": 30, "1分钟": 60, "3分钟": 180,
+            "5分钟": 300, "10分钟": 600,
+            "30分钟": 1800, "60分钟": 3600, "永不": 0,
+        }
+        self.refresh_interval_var = tk.StringVar(value="永不")
 
         # ── 管控(中间人)相关状态 ──
         self.gateway = ""          # 网关 IP
@@ -258,6 +268,20 @@ class LANScannerApp:
 
         ttk.Button(ctrl_frame, text="开始扫描", command=self.start_scan_thread).pack(side=tk.RIGHT)
         ttk.Button(ctrl_frame, text="⛔ 停止全部管控", command=self.stop_all_mitm).pack(side=tk.RIGHT, padx=4)
+        # 自动刷新频率下拉：右侧、开始扫描按钮左侧
+        ttk.Label(ctrl_frame, text="自动刷新:").pack(side=tk.RIGHT, padx=(10, 2))
+        self.refresh_interval_var.set("永不")
+        self._refresh_optionmenu = ttk.OptionMenu(
+            ctrl_frame, self.refresh_interval_var,
+            "永不", *self._auto_refresh_options.keys(),
+            command=lambda *_: self._on_refresh_interval_change())
+        self._refresh_optionmenu.pack(side=tk.RIGHT)
+        # 监听变量变化（用户切换下拉）—— trace_add 在 .set() 时触发，重入安全
+        try:
+            self.refresh_interval_var.trace_add("write",
+                lambda *_: self._on_refresh_interval_change())
+        except Exception:
+            pass
 
         # 搜索过滤框
         search_frame = ttk.Frame(main_frame)
@@ -273,29 +297,46 @@ class LANScannerApp:
         tree_frame.pack(fill=tk.BOTH, expand=True)
 
         columns = ("ip", "mac", "vendor", "name", "ports", "last_seen", "note", "ctrl", "speed")
-        self.tree = ttk.Treeview(tree_frame, columns=columns, show="headings", height=18, selectmode="extended")
-        widths = {"ip": 120, "mac": 140, "vendor": 100, "name": 110, "ports": 170,
-                  "last_seen": 130, "note": 110, "ctrl": 110, "speed": 130}
-        anchors = {"ip": tk.CENTER, "mac": tk.CENTER, "vendor": tk.CENTER,
+        self.tree = ttk.Treeview(tree_frame, columns=columns, show="headings",
+                                 height=18, selectmode="extended")
+        # 默认宽度：保证关键列默认完全可见；总宽≥主窗口(1280)，多出由水平滚动条接管
+        widths = {"ip": 160, "mac": 160, "vendor": 110, "name": 140, "ports": 240,
+                  "last_seen": 130, "note": 120, "ctrl": 110, "speed": 160}
+        anchors = {"ip": tk.W, "mac": tk.CENTER, "vendor": tk.CENTER,
                    "name": tk.W, "ports": tk.W, "last_seen": tk.CENTER, "note": tk.W,
                    "ctrl": tk.CENTER, "speed": tk.CENTER}
+        # 列标题加图标
+        headings = {"ip": "\U0001F310  IP", "mac": "MAC", "vendor": "厂商",
+                    "name": "设备名", "ports": "开放端口", "last_seen": "最近在线",
+                    "note": "备注", "ctrl": "管控", "speed": "实时流量"}
+        # 关键列：用户明确要求默认完全可见的列
+        self._key_columns = ("ip", "mac", "name", "ports")
         for col in columns:
-            self.tree.heading(col, text=col.upper(), command=lambda c=col: self.sort_treeview(c))
-            self.tree.column(col, width=widths[col], anchor=anchors[col])
+            self.tree.heading(col, text=headings[col],
+                              command=lambda c=col: self.sort_treeview(c))
+            # stretch=False：拖列边界不会撑大容器，列宽独立
+            self.tree.column(col, width=widths[col], anchor=anchors[col],
+                             stretch=False, minwidth=60)
 
         # 点击"管控"列 = 一键开/关禁止上网
         self.tree.bind("<Button-1>", self.on_tree_click)
 
         self.tree.tag_configure("online", foreground="#1a7f37")
         self.tree.tag_configure("offline", foreground="#999999")
+        # 浅色斑马纹 + 选中高亮
+        self.tree.tag_configure("zebra", background="#f6f8fa")
 
         self.tree.bind("<Button-3>", self.on_right_click)
         self.tree.bind("<Double-1>", self.on_double_click)
 
+        # 垂直滚动条 + 水平滚动条（关键列宽于窗口宽度时用水平滚动）
         scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=scrollbar.set)
-        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        hbar = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=scrollbar.set,
+                            xscrollcommand=hbar.set)
+        self.tree.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill="y")
+        hbar.pack(side=tk.BOTTOM, fill="x")
 
         # ── 列管理：显示/隐藏/锁定宽度 ──
         self.default_widths = dict(widths)        # 默认宽度备份，用于"恢复默认"
@@ -386,6 +427,41 @@ class LANScannerApp:
             self.status_var.set(f"已自动检测子网前缀: {s}.x")
         else:
             self.status_var.set("自动检测失败，请手动填写子网前缀。")
+
+    # ---------- 自动刷新 ----------
+    def _on_refresh_interval_change(self, *args):
+        """用户切换自动刷新频率时触发：取消旧 timer，按新间隔重排。"""
+        label = self.refresh_interval_var.get()
+        secs = self._auto_refresh_options.get(label, 0)
+        self._stop_auto_refresh()
+        if secs <= 0:
+            self.status_var.set("已停止自动刷新。")
+            return
+        self._schedule_auto_refresh(secs)
+        self.status_var.set(f"已设定自动刷新：每 {label} 扫一次。")
+
+    def _stop_auto_refresh(self):
+        if getattr(self, "_auto_refresh_after", None):
+            try:
+                self.root.after_cancel(self._auto_refresh_after)
+            except Exception:
+                pass
+            self._auto_refresh_after = None
+
+    def _schedule_auto_refresh(self, secs):
+        self._stop_auto_refresh()
+        self._auto_refresh_after = self.root.after(secs * 1000, self._auto_refresh_tick)
+
+    def _auto_refresh_tick(self):
+        self._auto_refresh_after = None
+        # 触发扫描（如尚未在跑）
+        if not self.scanning:
+            self.start_scan_thread()
+        # 排下一次
+        label = self.refresh_interval_var.get()
+        secs = self._auto_refresh_options.get(label, 0)
+        if secs > 0:
+            self._schedule_auto_refresh(secs)
 
     # ---------- 网关 / MAC 检测 ----------
     def detect_gateway(self):
@@ -542,6 +618,7 @@ class LANScannerApp:
         except Exception as e:
             self.root.after(0, lambda: messagebox.showerror("扫描错误", str(e)))
         finally:
+            self.scanning = False
             self.root.after(0, self.progress.stop)
 
     # ---------- 图标 ----------
@@ -722,6 +799,8 @@ class LANScannerApp:
                          command=lambda c=col: self._reset_column_width(c))
         menu.add_separator()
         # 批量操作
+        menu.add_command(label="📌 仅显示关键列 (IP/MAC/名/端口)",
+                         command=self._show_only_key_columns)
         menu.add_command(label="📋 恢复全部默认", command=self._reset_all_columns)
         menu.add_command(label="👁  全部显示", command=self._show_all_columns)
         # 解锁所有
@@ -802,6 +881,30 @@ class LANScannerApp:
         self.visible_columns = list(self.tree["columns"])
         self.tree.configure(displaycolumns=self.visible_columns)
         self.status_var.set("已显示全部列。")
+
+    def _show_only_key_columns(self):
+        """一键仅显示关键列 (ip/mac/name/ports)，其余隐藏。"""
+        key = list(getattr(self, "_key_columns", ("ip", "mac", "name", "ports")))
+        # 也根据默认宽度恢复这些关键列的列宽，避免被之前锁/拖破坏
+        for c in key:
+            if c in self.default_widths:
+                self.tree.column(c, width=self.default_widths[c], minwidth=60,
+                                 stretch=False)
+                # 如果是关键列被锁了，则解锁（避免一键后被锁回导致看不见）
+                if c in self.locked_widths:
+                    del self.locked_widths[c]
+        self.visible_columns = key
+        self.tree.configure(displaycolumns=self.visible_columns)
+        # 关键列保持宽度后停掉守卫避免覆盖
+        if self.locked_widths:
+            self._schedule_width_guard()
+        elif self._width_guard_after:
+            try:
+                self.root.after_cancel(self._width_guard_after)
+            except Exception:
+                pass
+            self._width_guard_after = None
+        self.status_var.set("已仅显示关键列：IP / MAC / 设备名 / 端口。其余列可右键菜单恢复。")
 
     def _unlock_all_columns(self):
         """解除全部宽度锁定"""
