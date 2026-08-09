@@ -706,47 +706,54 @@ class LANScannerApp:
         except Exception:
             sorted_devs = filtered
 
+        inserted = 0
         for idx, dev in enumerate(sorted_devs):
-            ports = dev.get("ports", [])
-            if isinstance(ports, list) and ports:
-                ports_disp = ", ".join(
-                    f"{p}({PORT_NAMES.get(p, '')})" if PORT_NAMES.get(p) else str(p)
-                    for p in ports
-                )
-            else:
-                ports_disp = ""
-            vendor = lookup_oui(dev.get("mac", ""))
-            tag = "online" if dev["ip"] in self.online_ips else "offline"
-            # 被禁/测速中的设备用专属 tag（不叠加 zebra，保证背景色不被覆盖）
-            st = self.mitm.get(ip)
-            if st:
-                if st["block"]:
-                    tag = "blocked"
+            try:
+                ip = dev["ip"]
+                ports = dev.get("ports", [])
+                if isinstance(ports, list) and ports:
+                    ports_disp = ", ".join(
+                        f"{p}({PORT_NAMES.get(p, '')})" if PORT_NAMES.get(p) else str(p)
+                        for p in ports
+                    )
                 else:
-                    tag = "monitoring"
-            if idx % 2 == 1 and tag in ("online", "offline"):
-                tag = (tag, "zebra")
-            ip = dev["ip"]
-            icon = self._icon_for(ip, dev)
-            ip_disp = f"{icon}  {ip}"
-            if st:
-                if st["block"]:
-                    ctrl_disp = "🚫 已禁网"
+                    ports_disp = ""
+                vendor = lookup_oui(dev.get("mac", ""))
+                tag = "online" if ip in self.online_ips else "offline"
+                # 被禁/测速中的设备用专属 tag（不叠加 zebra，保证背景色不被覆盖）
+                st = self.mitm.get(ip)
+                if st:
+                    if st["block"]:
+                        tag = "blocked"
+                    else:
+                        tag = "monitoring"
+                if idx % 2 == 1 and tag in ("online", "offline"):
+                    tag = (tag, "zebra")
+                icon = self._icon_for(ip, dev)
+                ip_disp = f"{icon}  {ip}"
+                if st:
+                    if st["block"]:
+                        ctrl_disp = "🚫 已禁网"
+                    else:
+                        ctrl_disp = "📊 测速中"
                 else:
-                    ctrl_disp = "📊 测速中"
-            else:
-                ctrl_disp = "✅ 允许"
-            speed_disp = f"↑{st.get('up_k', 0):.0f} ↓{st.get('down_k', 0):.0f} KB/s" if st else "—"
-            item = self.tree.insert("", tk.END,
-                             values=(ip_disp, dev.get("mac", ""), vendor,
-                                     dev.get("name", ""), ports_disp,
-                                     dev.get("last_seen", ""), dev.get("note", ""),
-                                     ctrl_disp, speed_disp),
-                             tags=tag if isinstance(tag, tuple) else (tag,))
-            self.tree_items[ip] = item
+                    ctrl_disp = "✅ 允许"
+                speed_disp = f"↑{st.get('up_k', 0):.0f} ↓{st.get('down_k', 0):.0f} KB/s" if st else "—"
+                item = self.tree.insert("", tk.END,
+                                 values=(ip_disp, dev.get("mac", ""), vendor,
+                                         dev.get("name", ""), ports_disp,
+                                         dev.get("last_seen", ""), dev.get("note", ""),
+                                         ctrl_disp, speed_disp),
+                                 tags=tag if isinstance(tag, tuple) else (tag,))
+                self.tree_items[ip] = item
+                inserted += 1
+            except Exception as e:
+                # 单台设备出问题不影响其他设备，输出到控制台便于排查
+                print(f"渲染设备 {dev.get('ip', '?')} 失败: {e}")
+                continue
 
         self.status_var.set(
-            f"共 {len(self.devices)} 台 | 显示 {len(filtered)} 台 | 在线 {len(self.online_ips)} 台 | 本机: {self.local_conn}")
+            f"共 {len(self.devices)} 台 | 显示 {len(filtered)} 台 | 渲染 {inserted} 台 | 在线 {len(self.online_ips)} 台 | 本机: {self.local_conn}")
 
     def sort_treeview(self, col):
         items = [(self.tree.set(i, col), i) for i in self.tree.get_children()]
